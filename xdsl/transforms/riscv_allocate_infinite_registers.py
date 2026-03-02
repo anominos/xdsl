@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 
 from xdsl.backend.register_allocatable import RegisterAllocatableOperation
+from xdsl.backend.register_stack import OutOfRegisters
+from xdsl.backend.register_type import RegisterType
 from xdsl.backend.riscv.register_stack import RiscvRegisterStack
 from xdsl.context import Context
 from xdsl.dialects import builtin, riscv, riscv_func
@@ -45,7 +47,10 @@ class RISCVAllocateInfiniteRegistersPass(ModulePass):
                             phys_reg = phys_reg_by_inf_reg[result_reg]
                         else:
                             # allocate a new phys reg
-                            phys_reg = register_stack.pop(type(result_reg))
-                            phys_reg_by_inf_reg[result_reg] = phys_reg
+                            try:
+                                phys_reg = register_stack.pop(type(result_reg))
+                                phys_reg_by_inf_reg[result_reg] = phys_reg
+                            except OutOfRegisters:
+                                continue
 
                         Rewriter.replace_value_with_new_type(result, phys_reg)
