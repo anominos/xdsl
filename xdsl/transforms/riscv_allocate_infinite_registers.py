@@ -39,6 +39,19 @@ def _get_srcs_and_dsts_from_swaps(
     return srcs, dsts
 
 
+def _get_next_virtual(func_op: riscv_func.FuncOp):
+    """Generator that yields the next unused virtual register."""
+    min_reg_data = 0
+    for reg in RegisterAllocatableOperation.iter_all_used_registers(func_op.body):
+        if _is_virtual_reg(reg) and isinstance(reg.index, builtin.IntAttr):
+            min_reg_data = min(min_reg_data, reg.index.data)
+
+    while True:
+        min_reg_data -= 1
+        print("Next vreg", riscv.IntRegisterType.infinite_register(~min_reg_data))
+        yield riscv.IntRegisterType.infinite_register(~min_reg_data)
+
+
 @dataclass(frozen=True)
 class RISCVAllocateInfiniteRegistersPass(ModulePass):
     """
@@ -98,11 +111,6 @@ class ResolveVirtualRegisters(ModulePass):
             value_by_reg: dict[RISCVRegisterType, SSAValue[builtin.Attribute]] = {}
 
             for inner_op in func_op.walk():
-                # update value by reg map
-                for result in inner_op.results:
-                    assert isinstance(result.type, RISCVRegisterType)
-                    value_by_reg[result.type] = result
-
                 # Create iterators of unused regs for current op to spill
                 # To get next unused register, call next() with appropriate iterator
                 inner_op_used_regs = set(inner_op.result_types).union(
@@ -166,3 +174,8 @@ class ResolveVirtualRegisters(ModulePass):
                 for result_type in inner_op.result_types:
                     assert isinstance(result_type, RISCVRegisterType)
                     func_defined_regs[type(result_type)].add(result_type)
+
+                # update value by reg map
+                for result in inner_op.results:
+                    assert isinstance(result.type, RISCVRegisterType)
+                    value_by_reg[result.type] = result
