@@ -1,16 +1,15 @@
 import typing as t
 from collections import defaultdict
-from collections.abc import Iterable
 from dataclasses import dataclass
 
 from ordered_set import OrderedSet
 
 from xdsl.backend.register_allocatable import RegisterAllocatableOperation
 from xdsl.backend.register_stack import OutOfRegisters
-from xdsl.backend.register_type import RegisterType
 from xdsl.backend.riscv.register_stack import RiscvRegisterStack
 from xdsl.context import Context
 from xdsl.dialects import builtin, riscv, riscv_func
+from xdsl.dialects.riscv.registers import RISCVRegisterType
 from xdsl.ir import SSAValue
 from xdsl.passes import ModulePass
 from xdsl.rewriter import InsertPoint, Rewriter
@@ -23,6 +22,21 @@ def _is_virtual_reg(reg: builtin.Attribute) -> t.TypeGuard[riscv.IntRegisterType
         and isinstance(reg.index, builtin.IntAttr)
         and reg.index.data < 0
     )
+
+
+def _get_srcs_and_dsts_from_swaps(
+    swaps: list[tuple[SSAValue, SSAValue]],
+) -> tuple[list[SSAValue], list[RISCVRegisterType]]:
+    srcs: list[SSAValue] = []
+    dsts: list[RISCVRegisterType] = []
+    for x, y in swaps:
+        assert isinstance(x.type, RISCVRegisterType)
+        assert isinstance(y.type, RISCVRegisterType)
+        srcs.append(x)
+        dsts.append(y.type)
+        srcs.append(y)
+        dsts.append(x.type)
+    return srcs, dsts
 
 
 @dataclass(frozen=True)
@@ -78,58 +92,77 @@ class ResolveVirtualRegisters(ModulePass):
 
     def apply(self, ctx: Context, op: builtin.ModuleOp) -> None:
         for func_op in (i for i in op.walk() if isinstance(i, riscv_func.FuncOp)):
-            used_regs_by_type: defaultdict[
-                type[RegisterType], OrderedSet[builtin.Attribute]
+            func_defined_regs: dict[
+                type[RISCVRegisterType], OrderedSet[RISCVRegisterType]
             ] = defaultdict(lambda: OrderedSet([]))
-            value_by_reg: dict[RegisterType, SSAValue] = {}
-            for inner_op in func_op.walk():
-                for result in inner_op.results:
-                    result_reg = result.type
-                    assert isinstance(result_reg, RegisterType)
-                    used_regs_by_type[type(result_reg)].add(result_reg)
-                    value_by_reg[result_reg] = result
+            value_by_reg: dict[RISCVRegisterType, SSAValue[builtin.Attribute]] = {}
 
+            for inner_op in func_op.walk():
+                # update value by reg map
+                for result in inner_op.results:
+                    assert isinstance(result.type, RISCVRegisterType)
+                    value_by_reg[result.type] = result
+
+                # Create iterators of unused regs for current op to spill
+                # To get next unused register, call next() with appropriate iterator
+                inner_op_used_regs = set(inner_op.result_types).union(
+                    inner_op.operand_types
+                )
+                op_unused_regs_iters = {
+                    reg_type: (i for i in regs if i not in inner_op_used_regs)
+                    for reg_type, regs in func_defined_regs.items()
+                }
+
+                # --- Spill virtual operands ---
                 # if any uses are virtual, insert a parallel move op to load the registers
                 virtuals = {
-                    operand_reg
-                    for operand_reg in inner_op.operand_types
-                    if _is_virtual_reg(operand_reg)
+                    (operand, operand.type)
+                    for operand in inner_op.operands
+                    if _is_virtual_reg(operand.type)
                 }
-                if len(virtuals) > 0:
-                    # load all operands
-                    # load non-virtual operands as well to ensure they are not spilled
-                    op_used_regs = set(
-                        operand_type for operand_type in inner_op.operand_types
+                swaps: list[tuple[SSAValue, SSAValue]] = []
+                for _, virtual_reg in virtuals:
+                    # swap virtual regs with unused physical regs
+                    op_not_used_reg = next(op_unused_regs_iters[type(virtual_reg)])
+                    swaps.append(
+                        (value_by_reg[virtual_reg], value_by_reg[op_not_used_reg])
                     )
-                    used_reg_iterators = {
-                        k: iter(v - op_used_regs) for k, v in used_regs_by_type.items()
-                    }
-                    srcs: list[SSAValue] = []
-                    dsts: list[riscv.RISCVRegisterType] = []
-                    for virtual_reg in virtuals:
-                        # swap virtual regs with unused physical regs
-                        reg = next(used_reg_iterators[type(virtual_reg)])
-                        assert isinstance(reg, riscv.RISCVRegisterType)
-                        srcs.append(value_by_reg[virtual_reg])
-                        dsts.append(reg)
-                        srcs.append(value_by_reg[reg])
-                        dsts.append(virtual_reg)
+                if swaps:
+                    # Load virtual registers
+                    srcs, dsts = _get_srcs_and_dsts_from_swaps(swaps)  # flattened list
+                    load_op = riscv.ParallelMovOp(
+                        srcs,
+                        dsts,
+                        builtin.DenseArrayBase.from_list(builtin.i32, [32] * len(srcs)),
+                        free_registers=builtin.ArrayAttr([]),
+                    )
+                    Rewriter.insert_op(load_op, InsertPoint.before(inner_op))
+                    # Replace virtual regs with the physical regs they are loaded into
+                    for i, value in enumerate(inner_op.operands):
+                        if _is_virtual_reg(value.type):
+                            idx = srcs.index(value)  # slow
+                            inner_op.operands[i] = load_op.results[idx]
 
-                        load_op = riscv.ParallelMovOp(
-                            srcs,
-                            dsts,
-                            builtin.DenseArrayBase.from_list(
-                                builtin.i32, [32] * len(srcs)
-                            ),
-                            free_registers=builtin.ArrayAttr([]),
+                    # Unload loaded registers back after the op
+                    src_types = tuple(i.type for i in srcs)
+                    src_types = t.cast(tuple[RISCVRegisterType], src_types)
+                    unload_op = riscv.ParallelMovOp(
+                        load_op.results,
+                        src_types,
+                        builtin.DenseArrayBase.from_list(builtin.i32, [32] * len(srcs)),
+                        free_registers=builtin.ArrayAttr([]),
+                    )
+                    Rewriter.insert_op(unload_op, InsertPoint.after(inner_op))
+                    # replace all later uses loaded values with the unloaded ones
+                    for old_value, new_value in zip(
+                        srcs, unload_op.results, strict=True
+                    ):
+                        old_value.replace_uses_with_if(
+                            new_value,
+                            lambda use: unload_op.is_before_in_block(use.operation),
                         )
-                        Rewriter.insert_op(load_op, InsertPoint.before(inner_op))
-                        for old_value, new_value in zip(
-                            srcs, load_op.results, strict=True
-                        ):
-                            old_value.replace_uses_with_if(
-                                new_value,
-                                lambda use: load_op.is_before_in_block(use.operation),
-                            )
-                            assert isinstance(new_value.type, RegisterType)
-                            value_by_reg[new_value.type] = new_value
+
+                # Add results to func_defined_regs
+                for result_type in inner_op.result_types:
+                    assert isinstance(result_type, RISCVRegisterType)
+                    func_defined_regs[type(result_type)].add(result_type)
