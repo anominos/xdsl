@@ -123,6 +123,9 @@ class ResolveVirtualRegisters(ModulePass):
                     for reg_type, regs in func_defined_regs.items()
                 }
 
+                # Used for update value by regs
+                new_ops: list[builtin.Operation] = []
+
                 # --- Spill virtual operands ---
                 # if any uses are virtual, insert a parallel move op to load the registers
                 virtuals = {
@@ -171,6 +174,8 @@ class ResolveVirtualRegisters(ModulePass):
                             new_value,
                             lambda use: unload_op.is_before_in_block(use.operation),
                         )
+
+                    new_ops.append(unload_op)
 
                 # --- Spill virtual results ---
                 # We need to spill space to put results into,
@@ -237,6 +242,9 @@ class ResolveVirtualRegisters(ModulePass):
                             and x.operation != spill_new_op,
                         )
 
+                    new_ops.append(spill_new_op)
+                    new_ops.append(load_op)
+
                 # Add results to func_defined_regs
                 for result_type in inner_op.result_types:
                     assert isinstance(result_type, RISCVRegisterType)
@@ -246,3 +254,8 @@ class ResolveVirtualRegisters(ModulePass):
                 for result in inner_op.results:
                     assert isinstance(result.type, RISCVRegisterType)
                     value_by_reg[result.type] = result
+
+                for new_op in new_ops:
+                    for result in new_op.results:
+                        assert isinstance(result.type, RISCVRegisterType)
+                        value_by_reg[result.type] = result
