@@ -110,6 +110,8 @@ class ResolveVirtualRegisters(ModulePass):
             ] = defaultdict(lambda: OrderedSet([]))
             value_by_reg: dict[RISCVRegisterType, SSAValue[builtin.Attribute]] = {}
 
+            next_virtual_reg = _get_next_virtual(func_op)
+
             for inner_op in func_op.walk():
                 # Create iterators of unused regs for current op to spill
                 # To get next unused register, call next() with appropriate iterator
@@ -168,6 +170,71 @@ class ResolveVirtualRegisters(ModulePass):
                         old_value.replace_uses_with_if(
                             new_value,
                             lambda use: unload_op.is_before_in_block(use.operation),
+                        )
+
+                # --- Spill virtual results ---
+                # We need to spill space to put results into,
+                # Then spill the result and load back to previous state
+                virtual_results = tuple(
+                    i for i in inner_op.results if _is_virtual_reg(i.type)
+                )
+                spill_regs = tuple(
+                    next(op_unused_regs_iters[type(vreg.type)])
+                    for vreg in virtual_results
+                )
+                # Create space for results by spilling
+                new_virtual_regs = tuple(
+                    next(next_virtual_reg) for _ in virtual_results
+                )
+                if virtual_results:
+                    # Spill space to put results in
+                    spill_op = riscv.ParallelMovOp(
+                        tuple(value_by_reg[i] for i in spill_regs),
+                        new_virtual_regs,
+                        builtin.DenseArrayBase.from_list(
+                            builtin.i32, [32] * len(virtual_results)
+                        ),
+                        free_registers=builtin.ArrayAttr([]),
+                    )
+                    Rewriter.insert_op(spill_op, InsertPoint.before(inner_op))
+                    # change results types to use newly freed regs
+                    virtual_results = tuple(
+                        Rewriter.replace_value_with_new_type(result, new_reg)
+                        for result, new_reg in zip(
+                            virtual_results, spill_regs, strict=True
+                        )
+                    )
+                    # Spill this result
+                    virtual_result_regs = tuple(
+                        next(next_virtual_reg) for _ in virtual_results
+                    )
+                    spill_new_op = riscv.ParallelMovOp(
+                        virtual_results,
+                        virtual_result_regs,
+                        builtin.DenseArrayBase.from_list(
+                            builtin.i32, [32] * len(virtual_results)
+                        ),
+                        free_registers=builtin.ArrayAttr([]),
+                    )
+                    Rewriter.insert_op(spill_new_op, InsertPoint.after(inner_op))
+                    # Reload old values
+                    load_op = riscv.ParallelMovOp(
+                        spill_op.results,
+                        spill_regs,
+                        builtin.DenseArrayBase.from_list(
+                            builtin.i32, [32] * len(virtual_results)
+                        ),
+                        free_registers=builtin.ArrayAttr([]),
+                    )
+                    Rewriter.insert_op(load_op, InsertPoint.after(spill_new_op))
+                    # Replace uses with virtual_results_regs
+                    for result, new_result in zip(
+                        virtual_results, spill_new_op.results, strict=True
+                    ):
+                        result.replace_uses_with_if(
+                            new_result,
+                            lambda x: x.operation != inner_op
+                            and x.operation != spill_new_op,
                         )
 
                 # Add results to func_defined_regs
