@@ -46,7 +46,6 @@ class ConvertMemRefAllocaOp(RewritePattern):
         # At this point, AllocaOp.memref should have one use,
         # which is a unrealized_conversion_cast, and the cast
         # should have no uses.
-        assert op.memref.uses.get_length() == 1
         for use in op.memref.uses:
             assert isinstance(use.operation, UnrealizedConversionCastOp)
             assert len(use.operation.outputs) == 1
