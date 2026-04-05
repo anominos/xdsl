@@ -312,3 +312,48 @@ memref.store %v, %m[%i0, %i1] : memref<2x3xf64, strided<[6, 1], offset: ?>>
 %v = memref.load %m[%i0] : memref<2xf64, strided<[?]>>
 
 // CHECK: MemRef memref<2xf64, strided<[?]>> with dynamic stride is not yet implemented
+
+// -----
+
+// Test AllocaOp with stores and loads
+riscv_func.func @first() -> () {
+    %m0 = memref.alloca() : memref<i32>
+    %m1 = memref.alloca() : memref<i32>
+    %m2 = memref.alloca() : memref<i32>
+    %v = "test.op"() : () -> (i32)
+    memref.store %v, %m0[] : memref<i32>
+    memref.store %v, %m1[] : memref<i32>
+    memref.store %v, %m2[] : memref<i32>
+    riscv_func.return
+}
+// CHECK:       builtin.module {
+// CHECK-NEXT:    riscv_func.func @first() {
+// CHECK-NEXT:      %0 = rv32.get_register : !riscv.reg<sp>
+// CHECK-NEXT:      %1 = riscv.addi %0, -16 : (!riscv.reg<sp>) -> !riscv.reg<sp>
+// CHECK-NEXT:      %v = "test.op"() : () -> i32
+// CHECK-NEXT:      %v_1 = builtin.unrealized_conversion_cast %v : i32 to !riscv.reg
+// CHECK-NEXT:      %2 = rv32.get_register : !riscv.reg<sp>
+// CHECK-NEXT:      riscv.sw %2, %v_1, 0 {comment = "store int value to memref of shape ()"} : (!riscv.reg<sp>, !riscv.reg) -> ()
+// CHECK-NEXT:      %v_2 = builtin.unrealized_conversion_cast %v : i32 to !riscv.reg
+// CHECK-NEXT:      %3 = rv32.get_register : !riscv.reg<sp>
+// CHECK-NEXT:      riscv.sw %3, %v_2, 4 {comment = "store int value to memref of shape ()"} : (!riscv.reg<sp>, !riscv.reg) -> ()
+// CHECK-NEXT:      %v_3 = builtin.unrealized_conversion_cast %v : i32 to !riscv.reg
+// CHECK-NEXT:      %4 = rv32.get_register : !riscv.reg<sp>
+// CHECK-NEXT:      riscv.sw %4, %v_3, 8 {comment = "store int value to memref of shape ()"} : (!riscv.reg<sp>, !riscv.reg) -> ()
+// CHECK-NEXT:      %5 = riscv.addi %0, 16 : (!riscv.reg<sp>) -> !riscv.reg<sp>
+// CHECK-NEXT:      riscv_func.return
+// CHECK-NEXT:    }
+riscv_func.func @second() -> () {
+    %m0 = memref.alloca() : memref<i32>
+    %v = memref.load %m0[] : memref<i32>
+    riscv_func.return
+}
+// CHECK-NEXT:    riscv_func.func @second() {
+// CHECK-NEXT:      %0 = rv32.get_register : !riscv.reg<sp>
+// CHECK-NEXT:      %1 = riscv.addi %0, -16 : (!riscv.reg<sp>) -> !riscv.reg<sp>
+// CHECK-NEXT:      %2 = rv32.get_register : !riscv.reg<sp>
+// CHECK-NEXT:      %v = riscv.lw %2, 0 {comment = "load word from memref of shape ()"} : (!riscv.reg<sp>) -> !riscv.reg
+// CHECK-NEXT:      %v_1 = builtin.unrealized_conversion_cast %v : !riscv.reg to i32
+// CHECK-NEXT:      %3 = riscv.addi %0, 16 : (!riscv.reg<sp>) -> !riscv.reg<sp>
+// CHECK-NEXT:      riscv_func.return
+// CHECK-NEXT:    }
