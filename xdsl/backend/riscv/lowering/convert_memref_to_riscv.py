@@ -40,6 +40,22 @@ from xdsl.traits import SymbolTable
 from xdsl.utils.exceptions import DiagnosticException
 
 
+class ConvertMemRefAllocaOp(RewritePattern):
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: memref.AllocaOp, rewriter: PatternRewriter) -> None:
+        # At this point, AllocaOp.memref should have one use,
+        # which is a unrealized_conversion_cast, and the cast
+        # should have no uses.
+        assert op.memref.uses.get_length() == 1
+        for use in op.memref.uses:
+            assert isinstance(use.operation, UnrealizedConversionCastOp)
+            assert len(use.operation.outputs) == 1
+            assert not use.operation.outputs[0].uses
+
+            rewriter.erase_op(use.operation)
+        rewriter.erase_op(op)
+
+
 class ConvertMemRefAllocOp(RewritePattern):
     @op_type_rewrite_pattern
     def match_and_rewrite(self, op: memref.AllocOp, rewriter: PatternRewriter) -> None:
@@ -427,6 +443,10 @@ class ConvertMemRefToRiscvPass(ModulePass):
                 ],
                 dce_enabled=False,
             )
+        ).rewrite_module(op)
+        # At this point, AllocaOps should be dead and can be removed.
+        PatternRewriteWalker(
+            ConvertMemRefAllocaOp(),
         ).rewrite_module(op)
         if contains_malloc:
             func_op = riscv_func.FuncOp(
