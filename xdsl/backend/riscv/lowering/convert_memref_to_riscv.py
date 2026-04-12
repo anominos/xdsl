@@ -43,16 +43,35 @@ from xdsl.utils.exceptions import DiagnosticException
 class ConvertMemRefAllocaOp(RewritePattern):
     @op_type_rewrite_pattern
     def match_and_rewrite(self, op: memref.AllocaOp, rewriter: PatternRewriter) -> None:
-        # At this point, AllocaOp.memref should have one use,
-        # which is a unrealized_conversion_cast, and the cast
-        # should have no uses.
+        assert isinstance(op.memref.type.element_type, FixedBitwidthType)
+        alloca_op = riscv.stack.AllocaOp(op.memref.type.element_type)
         for use in op.memref.uses:
-            assert isinstance(use.operation, UnrealizedConversionCastOp)
-            assert len(use.operation.outputs) == 1
-            assert not use.operation.outputs[0].uses
+            if isinstance(use.operation, memref.StoreOp):
+                if use.operation.indices:
+                    raise NotImplementedError(
+                        "Alloca memrefs cannot be accessed with indices"
+                    )
 
-            rewriter.erase_op(use.operation)
-        rewriter.erase_op(op)
+                rewriter.replace_op(
+                    use.operation, riscv.stack.StoreOp(alloca_op, use.operation.value)
+                )
+            elif isinstance(use.operation, memref.LoadOp):
+                if use.operation.indices:
+                    raise NotImplementedError(
+                        "Alloca memrefs cannot be accessed with indices"
+                    )
+
+                rd = use.operation.res.type
+                if not isinstance(rd, riscv.RISCVRegisterType):
+                    rd = None
+
+                rewriter.replace_op(use.operation, riscv.stack.LoadOp(alloca_op, rd=rd))
+            elif not isinstance(use.operation, memref.AllocaOp):
+                # We can ignore the AllocaOp case
+                # since we replace_matched_op at the end of this function
+                raise RuntimeError("Alloca memrefs only support LoadOp and StoreOp")
+
+        rewriter.replace_matched_op(alloca_op)
 
 
 class ConvertMemRefAllocOp(RewritePattern):
@@ -431,6 +450,9 @@ class ConvertMemRefToRiscvPass(ModulePass):
             ConvertMemRefDeallocOp()
         ).rewrite_module(op)
         PatternRewriteWalker(
+            ConvertMemRefAllocaOp(),
+        ).rewrite_module(op)
+        PatternRewriteWalker(
             GreedyRewritePatternApplier(
                 [
                     ConvertMemRefDeallocOp(),
@@ -442,10 +464,6 @@ class ConvertMemRefToRiscvPass(ModulePass):
                 ],
                 dce_enabled=False,
             )
-        ).rewrite_module(op)
-        # At this point, AllocaOps should be dead and can be removed.
-        PatternRewriteWalker(
-            ConvertMemRefAllocaOp(),
         ).rewrite_module(op)
         if contains_malloc:
             func_op = riscv_func.FuncOp(
