@@ -7,7 +7,7 @@ from xdsl.backend.riscv.lowering.utils import (
     cast_operands_to_regs,
     register_type_for_type,
 )
-from xdsl.builder import ImplicitBuilder
+from xdsl.builder import ImplicitBuilder, InsertPoint
 from xdsl.context import Context
 from xdsl.dialects import memref, riscv, riscv_func, rv32
 from xdsl.dialects.builtin import (
@@ -46,31 +46,35 @@ class ConvertMemRefAllocaOp(RewritePattern):
         assert isinstance(op.memref.type.element_type, FixedBitwidthType)
         alloca_op = riscv.stack.AllocaOp(op.memref.type.element_type)
         for use in op.memref.uses:
-            if isinstance(use.operation, memref.StoreOp):
-                if use.operation.indices:
+            use_op = use.operation
+            rewriter.insertion_point = InsertPoint.before(use.operation)
+
+            if isinstance(use_op, memref.StoreOp):
+                value, mem, *indices = cast_operands_to_regs(rewriter, use_op)
+                if indices:
                     raise NotImplementedError(
                         "Alloca memrefs cannot be accessed with indices"
                     )
 
-                rewriter.replace_op(
-                    use.operation, riscv.stack.StoreOp(alloca_op, use.operation.value)
-                )
-            elif isinstance(use.operation, memref.LoadOp):
-                if use.operation.indices:
+                rewriter.replace_op(use_op, riscv.stack.StoreOp(alloca_op, value))
+            elif isinstance(use_op, memref.LoadOp):  #
+                mem, *indices = cast_operands_to_regs(rewriter, use_op)
+                if indices:
                     raise NotImplementedError(
                         "Alloca memrefs cannot be accessed with indices"
                     )
 
-                rd = use.operation.res.type
+                rd = use_op.res.type
                 if not isinstance(rd, riscv.RISCVRegisterType):
                     rd = None
 
-                rewriter.replace_op(use.operation, riscv.stack.LoadOp(alloca_op, rd=rd))
-            elif not isinstance(use.operation, memref.AllocaOp):
+                rewriter.replace_op(use_op, riscv.stack.LoadOp(alloca_op, rd=rd))
+            elif not isinstance(use_op, memref.AllocaOp):
                 # We can ignore the AllocaOp case
                 # since we replace_matched_op at the end of this function
                 raise RuntimeError("Alloca memrefs only support LoadOp and StoreOp")
 
+        rewriter.insertion_point = InsertPoint.before(op)
         rewriter.replace_matched_op(alloca_op)
 
 
